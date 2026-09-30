@@ -1,0 +1,229 @@
+# docker-compose.yaml
+# DHAP-34 — Email Event Extraction Airflow Pipeline
+#
+# Services
+# --------
+#   postgres-meta    — PostgreSQL used exclusively by Airflow as its metadata DB.
+#                      Do NOT point your DAG at this DB.
+#   postgres-target  — Separate PostgreSQL instance that acts as the data warehouse.
+#                      The Airflow DAG loads email_events rows into this DB.
+#   airflow-init     — One-shot init container: creates the Airflow DB, admin user,
+#                      the Airflow Connection for postgres-target, and runs ddl.sql
+#                      to create the target table.
+#   airflow-webserver — Airflow web UI (http://localhost:8080)
+#   airflow-scheduler — Airflow scheduler (LocalExecutor — no Celery/Redis needed)
+#
+# Volume mounts
+# -------------
+#   ./dags     → /opt/airflow/dags      (DAG files)
+#   ./data     → /opt/airflow/data      (CSV input files)
+#   ./scripts  → /opt/airflow/scripts   (flatten script, not used at runtime)
+#   ./config   → /opt/airflow/config    (manifest.yaml, schema.yaml)
+#   ./sql      → /opt/airflow/sql       (ddl.sql)
+#
+# Quick start
+# -----------
+#   cp .env.example .env   # fill in real values (or use the provided defaults)
+#   docker compose up -d
+#   # Airflow UI → http://localhost:8080  (admin / admin)
+#
+# Environment
+# -----------
+# All secrets are read from the .env file at compose startup.
+# Never commit a populated .env to version control.
+
+version: "3.8"
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+
+    # Metadata DB connection (Airflow internal)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-meta:5432/airflow_meta
+
+    # Webserver secret key — set a stable value so sessions survive restarts
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-changeme_replace_in_dotenv}
+
+    # -----------------------------------------------------------------------
+    # Airflow Connection for the TARGET database (the warehouse).
+    # Injected as an environment variable — no UI clicking required.
+    # Format: postgresql://<user>:<password>@<host>:<port>/<dbname>
+    # -----------------------------------------------------------------------
+    AIRFLOW_CONN_POSTGRES_TARGET: >-
+      postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${TARGET_DB_HOST}:${TARGET_DB_PORT}/${TARGET_DB_NAME}
+
+    # Expose config/data paths to tasks via env vars (read inside task functions)
+    MAILEX_SCHEMA_PATH: /opt/airflow/config/schema.yaml
+    MAILEX_CSV_PATH: /opt/airflow/data/raw/email_event_extraction.csv
+
+    # Pass UID through so file ownership in volumes is correct
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./data:/opt/airflow/data
+    - ./scripts:/opt/airflow/scripts
+    - ./config:/opt/airflow/config
+    - ./sql:/opt/airflow/sql
+    - airflow_logs:/opt/airflow/logs
+
+  user: "${AIRFLOW_UID:-50000}:0"
+
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+
+services:
+  # --------------------------------------------------------------------------
+  # postgres-meta: Airflow internal metadata database
+  # --------------------------------------------------------------------------
+  postgres-meta:
+    image: postgres:15
+    container_name: mailex_postgres_meta
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow_meta
+    volumes:
+      - pg_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d airflow_meta"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # postgres-target: The data warehouse DB where email_events rows land.
+  # Deliberately separate from postgres-meta so the Airflow metadata DB
+  # cannot be accidentally truncated by pipeline runs.
+  # --------------------------------------------------------------------------
+  postgres-target:
+    image: postgres:15
+    container_name: mailex_postgres_target
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${TARGET_DB_NAME}
+    ports:
+      - "5433:5432"   # Exposed on 5433 to avoid conflict with postgres-meta
+    volumes:
+      - pg_target_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${TARGET_DB_NAME}"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # airflow-init: One-shot initialisation container.
+  # Runs db migrate, creates admin user, creates the Airflow Connection for
+  # the target DB, and executes ddl.sql against postgres-target.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: mailex_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+
+        echo "=== [airflow-init] Running Airflow DB migrations ==="
+        airflow db migrate
+
+        echo "=== [airflow-init] Creating admin user ==="
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          || echo "Admin user already exists, skipping."
+
+        echo "=== [airflow-init] Creating postgres_target Airflow Connection ==="
+        airflow connections delete postgres_target 2>/dev/null || true
+        airflow connections add postgres_target \
+          --conn-type postgres \
+          --conn-host ${TARGET_DB_HOST} \
+          --conn-login ${POSTGRES_USER} \
+          --conn-password ${POSTGRES_PASSWORD} \
+          --conn-schema ${TARGET_DB_NAME} \
+          --conn-port ${TARGET_DB_PORT}
+
+        echo "=== [airflow-init] Applying DDL to postgres-target ==="
+        PGPASSWORD=${POSTGRES_PASSWORD} psql \
+          -h ${TARGET_DB_HOST} \
+          -U ${POSTGRES_USER} \
+          -d ${TARGET_DB_NAME} \
+          -p ${TARGET_DB_PORT} \
+          -f /opt/airflow/sql/ddl.sql
+
+        echo "=== [airflow-init] Done. ==="
+
+    environment:
+      <<: *airflow-common-env
+      # Suppress the "first-run" prompt
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-target:
+        condition: service_healthy
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # airflow-webserver: Airflow UI on http://localhost:8080
+  # --------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: mailex_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-target:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # airflow-scheduler: LocalExecutor scheduler (no Celery/Redis)
+  # --------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mailex_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-target:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg_meta_data:
+  pg_target_data:
+  airflow_logs:

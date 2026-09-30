@@ -1,0 +1,29 @@
+# Springer_Capital_Projects — Root .gitignore
+# Applies to ALL sub-projects in this monorepo
+
+# Never commit real credentials or local dev overrides
+**/.env
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/*.egg-info/
+**/.venv/
+**/venv/
+**/env/
+
+# Generated large data files (regenerated locally by scripts)
+**/data/raw/email_event_extraction.csv
+**/data/raw/email_event_extraction_bad.csv
+
+# Airflow
+**/logs/
+**/airflow.db
+
+# Docker
+**/.docker/
+
+# OS
+**/.DS_Store
+**/Thumbs.db
