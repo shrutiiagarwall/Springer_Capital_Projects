@@ -1,0 +1,114 @@
+# schema_contract.yaml
+# DHAP-42 — MailEx Email-Event-Extraction Schema Contract
+# ---------------------------------------------------------------------------
+# This file defines the exact schema that the CSV must satisfy before any
+# data is written to MinIO.  Every rule is enforced at runtime by the
+# validate_contract task in the Airflow DAG.
+#
+# Enforcement rules:
+#   - Missing column       → FAIL (AirflowFailException)
+#   - Renamed column       → FAIL (detected as missing + extra)
+#   - Extra column         → FAIL  (allow_extra_columns: false)
+#   - Wrong column order   → FAIL  (columns must appear in the declared order)
+#   - Wrong type           → FAIL  (strict, no silent coercion)
+#   - Null in non-nullable → FAIL
+#   - Value-rule violation → FAIL  (allowed_values / regex / min_value / non_empty)
+#   - Duplicate id         → FAIL  (unique: [id])
+#   - Empty file           → FAIL  (min_rows: 1)
+#
+# All violations are collected and reported together (not fail-fast) so the
+# caller sees the full picture in one error message.
+# ---------------------------------------------------------------------------
+
+version: "1.0"
+
+global:
+  allow_extra_columns: false     # any column not listed below → FAIL
+  enforce_column_order: true     # columns must appear in the exact order below
+  min_rows: 1                    # empty file / header-only → FAIL
+  unique:
+    - id                         # id must be unique across all rows
+
+columns:
+  # ── Column 1 ─────────────────────────────────────────────────────────────
+  - name: id
+    type: integer
+    nullable: false
+    unique: true                 # enforced by global.unique list above
+    description: "Monotonically increasing row identifier. Must be a valid integer."
+
+  # ── Column 2 ─────────────────────────────────────────────────────────────
+  - name: thread_file
+    type: string
+    nullable: false
+    regex: "^.+\\.json$"         # must end with ".json"
+    description: "Filename of the source JSON email thread (e.g. bass-e_inbox114.json)."
+
+  # ── Column 3 ─────────────────────────────────────────────────────────────
+  - name: split
+    type: string
+    nullable: false
+    allowed_values:
+      - train
+      - dev
+      - test
+    description: "Dataset split. Exactly 3 values; used as Hive partition key."
+
+  # ── Column 4 ─────────────────────────────────────────────────────────────
+  - name: turn_id
+    type: string
+    nullable: false
+    regex: "^turn_\\d+$"         # matches turn_0 … turn_10 (and future turns)
+    description: "Turn identifier within the email thread (e.g. turn_0)."
+
+  # ── Column 5 ─────────────────────────────────────────────────────────────
+  - name: event_type
+    type: string
+    nullable: false
+    allowed_values:
+      - Deliver_Action_Data
+      - Deliver_Data
+      - Deliver_Meeting_Data
+      - Request_Action
+      - Request_Data
+      - Request_Meeting
+      - Request_Action_Data
+      - Request_Meeting_Data
+      - Amend_Data
+      - Amend_Meeting_Data
+      - Amend_Action_Data
+      - O
+    description: "Event type label (12 classes). 'O' = outside / no event."
+
+  # ── Column 6 ─────────────────────────────────────────────────────────────
+  - name: trigger_text
+    type: string
+    nullable: true               # many nulls, especially when event_type == "O"
+    description: "The textual trigger span for the event. Null when event_type is O."
+
+  # ── Column 7 ─────────────────────────────────────────────────────────────
+  - name: trigger_indices
+    type: string
+    nullable: true               # null when trigger_text is null
+    regex: "^\\d+(\\s\\d+)*$"   # space-separated integers, e.g. "18 19 20 21"
+    description: "Token indices of the trigger span. Null when trigger_text is null."
+
+  # ── Column 8 ─────────────────────────────────────────────────────────────
+  - name: extras
+    type: string
+    nullable: true               # 2,411 nulls in the dataset
+    description: "Optional extra annotations (argument role–value pairs). May be null."
+
+  # ── Column 9 ─────────────────────────────────────────────────────────────
+  - name: sentence_text
+    type: string
+    nullable: false
+    non_empty: true              # must not be blank after stripping whitespace
+    description: "Full sentence text. Always present; may be several thousand chars."
+
+  # ── Column 10 ────────────────────────────────────────────────────────────
+  - name: num_arguments
+    type: integer
+    nullable: false
+    min_value: 0                 # argument count is always non-negative
+    description: "Number of event arguments annotated for this row."

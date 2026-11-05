@@ -1,0 +1,68 @@
+# manifest.yaml
+# DHAP-42 — Local CSV → MinIO Parquet Ingestion Pipeline
+# ---------------------------------------------------------------------------
+# Metadata describing the MailEx Email-Event-Extraction dataset and the
+# pipeline that ingests it.
+# ---------------------------------------------------------------------------
+
+dataset:
+  name: mailex_email_event_extraction
+  display_name: "MailEx Email-Event-Extraction"
+  description: >
+    Conversational email threads annotated with event types, triggers, and
+    arguments. Published at EMNLP 2023 as part of the MailEx benchmark for
+    information extraction from email conversations.
+  source:
+    paper: "MailEx: Email Event and Argument Extraction (EMNLP 2023)"
+    repo: "https://github.com/salokr/Email-Event-Extraction"
+    license: "Research use (see paper)"
+  owner: "DHAP-42 / Springer Capital intern project"
+  status: "active"
+  version: "1.0.0"
+
+file:
+  path: "dags/extraction/sample.csv"
+  format: "csv"
+  encoding: "utf-8"
+  line_endings: "CRLF"
+  row_count: 9168
+  column_count: 10
+  size_bytes: 5576427
+  duplicates_ignoring_id: 9
+  rows_after_dedup: 9159
+
+pipeline:
+  dag_id: "csv_to_parquet_minio"
+  target_format: "parquet"
+  compression: "snappy"
+  partition_column: "split"
+  partition_values:
+    - train   # 7207 rows (≈ 78.6%)
+    - dev     # 1016 rows (≈ 11.1%)
+    - test    # 945 rows  (≈ 10.3%)
+
+storage:
+  bucket: "${MINIO_BUCKET}"          # resolved from .env at runtime
+  prefix: "email_event_extraction"
+  layout: "hive"                     # split=<value>/part-0.parquet
+  object_paths:
+    - "email_event_extraction/split=train/part-0.parquet"
+    - "email_event_extraction/split=dev/part-0.parquet"
+    - "email_event_extraction/split=test/part-0.parquet"
+
+partitioning_rationale: >
+  The `split` column was chosen as the partition key because:
+    (1) It has exactly 3 distinct values (train / dev / test) — producing a
+        small, manageable number of partition files.
+    (2) All values are non-null — Hive-style partitioning requires a non-null key.
+    (3) The partition sizes are reasonably balanced (7k / 1k / 0.9k rows).
+    (4) Downstream consumers almost always query by split (e.g. "load train set"
+        or "evaluate on test set"), so partitioning on this key enables predicate
+        push-down.
+
+  Rejected alternatives:
+    - `event_type` (12 values): too many small partitions; "O" alone has 789 rows
+      while others range from 85 to 1,600, creating very uneven shards.
+    - `thread_file` (1,500 distinct values): would produce 1,500 tiny files,
+        each averaging ~6 rows — an anti-pattern that hurts read performance and
+        object-store list operations.

@@ -1,0 +1,48 @@
+# Dockerfile.minio
+# DHAP-42 — Real MinIO server built from GitHub Releases
+#
+# Why this Dockerfile instead of the minio/minio Docker Hub image?
+# Docker Hub org-level images are blocked by the corporate proxy in this
+# environment.  Official library images (debian:12-slim) are not blocked,
+# so we build from there and pull the MinIO binary from GitHub Releases.
+#
+# Distribution format change (as of ~2024-09):
+#   MinIO stopped publishing plain binaries on GitHub Releases; assets are
+#   now RPM / DEB packages plus per-OS named binaries
+#   (e.g. minio.linux-amd64.RELEASE.XXXX).  dl.min.io returns HTTP 410.
+#   We install the amd64 DEB so dpkg handles path / permissions cleanly.
+#
+# What this does:
+#   1. Starts from debian:12-slim (official library image — always pullable).
+#   2. Installs curl + ca-certificates (for the HTTPS download).
+#   3. Queries the GitHub Releases API (newest-first) to find the most-recent
+#      release that has binary assets (some tags are source-only).
+#   4. Downloads the amd64 DEB package and installs it with dpkg.
+#   5. Verifies the binary via `minio --version`.
+#
+# The resolved release tag and DEB URL are printed during build so the
+# exact version baked into the image is visible in the build log.
+
+FROM debian:12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Query the GitHub Releases API (up to 10 releases) and install the first
+# amd64 DEB found.  Skips source-only tags (no assets) automatically.
+RUN set -ex \
+    && DEB_URL=$(curl -fsSL "https://api.github.com/repos/minio/minio/releases?per_page=10" \
+        | grep '"browser_download_url".*_amd64\.deb"' \
+        | grep -v sha256sum \
+        | head -1 \
+        | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') \
+    && echo "=== MinIO DEB URL: ${DEB_URL} ===" \
+    && curl -fsSL -L "${DEB_URL}" -o /tmp/minio.deb \
+    && dpkg -i /tmp/minio.deb \
+    && rm /tmp/minio.deb \
+    && minio --version
+
+EXPOSE 9000 9001
+
+ENTRYPOINT ["minio"]
