@@ -1,7 +1,7 @@
 """
 verify_pipeline.py
 ==================
-DHAP-42 — End-to-End Verification Script
+Stage 2 — End-to-End Verification Script
 
 Runs all verification steps:
 1. Checks all Docker containers are healthy
@@ -139,12 +139,12 @@ def save_evidence(filename, content):
 
 def main():
     print("=" * 70)
-    print("DHAP-42 — End-to-End Pipeline Verification")
+    print("Stage 2 — End-to-End Pipeline Verification")
     print("=" * 70)
 
     evidence_lines = []
 
-    # ── Step 1: Check containers ─────────────────────────────────────────────
+    # ── Step 1: Check containers ───────────────────────────────────────────
     print("\n[1] Checking Docker containers...")
     result = subprocess.run(
         ["docker", "compose", "ps", "--format", "json"],
@@ -155,11 +155,11 @@ def main():
     print(containers_json[:2000])
     evidence_lines.append("## Docker Compose Status\n```\n" + result.stdout + "\n```\n")
 
-    # ── Step 2: Unpause DAG ──────────────────────────────────────────────────
+    # ── Step 2: Unpause DAG ────────────────────────────────────────────────
     print("\n[2] Unpausing DAG...")
     unpause_dag()
 
-    # ── Step 3: Good run ─────────────────────────────────────────────────────
+    # ── Step 3: Good run ───────────────────────────────────────────────────
     print("\n[3] Triggering good CSV run...")
     run_id, state = trigger_and_wait()
     task_states = get_task_states(run_id)
@@ -173,7 +173,7 @@ def main():
     print("  ✓ All 4 tasks green!")
     evidence_lines.append(f"## Good Run\n- run_id: {run_id}\n- state: {state}\n- tasks: {task_states}\n")
 
-    # ── Step 4: Verify MinIO ─────────────────────────────────────────────────
+    # ── Step 4: Verify MinIO ───────────────────────────────────────────────
     print("\n[4] Reading back Parquet from MinIO...")
     total_rows, per_split, objects = read_parquet_from_minio()
     print(f"  Total rows: {total_rows}  (expected: {EXPECTED_TOTAL_ROWS})")
@@ -188,7 +188,7 @@ def main():
         f"- Objects: {[o['Key'] for o in objects]}\n"
     )
 
-    # ── Step 5: Idempotency ───────────────────────────────────────────────────
+    # ── Step 5: Idempotency ────────────────────────────────────────────────
     print("\n[5] Idempotency check (re-trigger)...")
     run_id2, state2 = trigger_and_wait()
     total2, per_split2, objects2 = read_parquet_from_minio()
@@ -203,8 +203,8 @@ def main():
         f"- Total rows: {total2} (same)\n- Objects: {len(objects2)} (same)\n"
     )
 
-    # ── Save evidence ────────────────────────────────────────────────────────
-    evidence_content = f"# DHAP-42 Verification Evidence\n\n" + "\n".join(evidence_lines)
+    # ── Save evidence ──────────────────────────────────────────────────────
+    evidence_content = f"# Stage 2 Verification Evidence\n\n" + "\n".join(evidence_lines)
     save_evidence("verification_results.md", evidence_content)
 
     print("\n" + "=" * 70)

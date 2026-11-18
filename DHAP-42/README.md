@@ -1,408 +1,400 @@
-# DHAP-42 — Local CSV → MinIO Parquet Ingestion Pipeline
+# Stage 2 — Local CSV → MinIO Parquet Ingestion Pipeline
 
-> **Intern project** — Springer Capital Data Engineering  
-> Dataset: MailEx Email-Event-Extraction (EMNLP 2023)  
-> Predecessor: [DHAP-34](../Email_Event_Extraction/email-event-extraction/) — CSV → PostgreSQL via Dockerized Airflow
+A self-contained Airflow + MinIO pipeline that ingests the
+[MailEx Email-Event-Extraction](https://github.com/salokr/Email-Event-Extraction) dataset
+(CSV) into an S3-compatible object store as Snappy-compressed Parquet files,
+partitioned by `split` (train / dev / test).
 
----
-
-## Overview
-
-This project implements a production-quality data ingestion pipeline that reads
-a curated CSV of email-event annotations, enforces a strict schema contract,
-transforms the data, and writes Snappy-compressed Parquet files to a MinIO
-(S3-compatible) object store — all orchestrated by Apache Airflow running in Docker.
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Docker Compose Stack                          │
-│                                                                      │
-│  ┌──────────────┐        ┌────────────────────────────────────────┐ │
-│  │ postgres-meta│        │         Airflow (LocalExecutor)         │ │
-│  │  (metadata)  │◄──────►│                                        │ │
-│  └──────────────┘        │  DAG: csv_to_parquet_minio             │ │
-│                          │                                        │ │
-│                          │  read_csv                              │ │
-│                          │     ↓                                  │ │
-│                          │  validate_contract ── FAIL here        │ │
-│                          │     ↓            on any violation      │ │
-│                          │  transform                             │ │
-│                          │     ↓                                  │ │
-│                          │  write_parquet_to_minio                │ │
-│                          └──────────────┬─────────────────────────┘ │
-│                                         │ boto3 (S3 API)            │
-│  ┌──────────────────────────────────────▼─────────────────────────┐ │
-│  │                         MinIO                                   │ │
-│  │  API  :9000 (internal) / :9020 (host)                          │ │
-│  │  UI   :9001 (internal) / :9021 (host)                          │ │
-│  │                                                                 │ │
-│  │  mailex-parquet/                                                │ │
-│  │    email_event_extraction/                                      │ │
-│  │      split=train/part-0.parquet   (7,199 rows after dedup)     │ │
-│  │      split=dev/part-0.parquet     (1,015 rows after dedup)     │ │
-│  │      split=test/part-0.parquet    (  945 rows after dedup)     │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                      │
-│  ┌──────────────┐                                                    │
-│  │   mc-init    │  (one-shot: creates bucket on startup, idempotent) │
-│  └──────────────┘                                                    │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Mermaid Diagram
-
-```mermaid
-flowchart LR
-    CSV["📄 sample.csv\n(dags/extraction/)"] --> read_csv
-
-    subgraph Airflow DAG: csv_to_parquet_minio
-        read_csv["read_csv\n(raw.parquet → /tmp/)"]
-        validate_contract["validate_contract\n(schema_contract.yaml)"]
-        transform["transform\n(dedup, audit cols,\nclean.parquet → /tmp/)"]
-        write_parquet_to_minio["write_parquet_to_minio\n(3 Hive partitions)"]
-
-        read_csv --> validate_contract
-        validate_contract -->|FAIL on violation| X["❌ DAG fails\n(no data written)"]
-        validate_contract --> transform
-        transform --> write_parquet_to_minio
-    end
-
-    write_parquet_to_minio --> MinIO
-
-    subgraph MinIO: mailex-parquet
-        T["split=train/part-0.parquet"]
-        D["split=dev/part-0.parquet"]
-        TE["split=test/part-0.parquet"]
-    end
-
-    MinIO --> T & D & TE
-```
+> **Stage 1** (Postgres ingestion pipeline) lives in a separate folder in this repository.
 
 ---
 
-## Relationship to DHAP-34
+## Table of Contents
 
-| Aspect | DHAP-34 | DHAP-42 |
-|--------|---------|---------|
-| Target | PostgreSQL (warehouse) | MinIO (object store) |
-| Format | SQL rows | Parquet (partitioned) |
-| Ports | Airflow :8080 | Airflow :8082 |
-| Validation | Missing col + nullable + int type | Full schema contract (12 checks) |
-| Transport | XCom JSON string | Temp Parquet file in /tmp/ |
-| Idempotency | TRUNCATE + INSERT | Delete prefix then write |
-| Connection | AIRFLOW_CONN_POSTGRES_TARGET | AIRFLOW_CONN_MINIO_S3 |
+1. [Architecture](#architecture)
+2. [Prerequisites](#prerequisites)
+3. [Setup](#setup)
+4. [Starting the Stack](#starting-the-stack)
+5. [Airflow UI](#airflow-ui)
+6. [MinIO Console](#minio-console)
+7. [Triggering the DAG](#triggering-the-dag)
+8. [Verifying Objects in MinIO](#verifying-objects-in-minio)
+9. [Negative Tests](#negative-tests)
+10. [Idempotency](#idempotency)
+11. [Folder Layout](#folder-layout)
+12. [Troubleshooting](#troubleshooting)
 
-Both stacks can run **simultaneously** with no port conflicts.
+---
+
+## Architecture
+
+```
+                        ┌──────────────────────────────────────────┐
+                        │           Docker Compose Stack            │
+                        │                                           │
+  host :8082 ──────────►│  airflow-webserver  (Airflow 2.x UI)     │
+                        │          │                                │
+                        │  airflow-scheduler  (LocalExecutor)       │
+                        │          │                                │
+                        │          ▼                                │
+                        │   ┌─────────────────────────────┐        │
+                        │   │   DAG: csv_to_parquet_minio  │        │
+                        │   │                              │        │
+                        │   │  read_csv                    │        │
+                        │   │     │                        │        │
+                        │   │  validate_contract           │        │
+                        │   │     │                        │        │
+                        │   │  transform                   │        │
+                        │   │     │                        │        │
+                        │   │  write_parquet_to_minio ─────┼───────►│  minio (pgsty/silo)
+                        │   └─────────────────────────────┘        │  API  :9020
+                        │                                           │  UI   :9021
+                        │  postgres-meta  (Airflow metadata DB)     │
+                        └──────────────────────────────────────────┘
+```
+
+### DAG Task Graph
+
+```
+read_csv ──► validate_contract ──► transform ──► write_parquet_to_minio
+```
+
+| Task | What it does |
+|------|-------------|
+| `read_csv` | Reads the CSV from disk, writes raw Parquet to `/tmp/<run_id>/raw.parquet` |
+| `validate_contract` | Checks all schema rules in `mailex_email_event_extraction/schema_contract.yaml`; fails fast on any violation |
+| `transform` | Strips whitespace, drops 9 exact duplicates, adds `ingested_at` + `run_id` audit columns |
+| `write_parquet_to_minio` | Deletes existing objects under prefix (idempotency), writes 3 Hive-partitioned Parquet files |
+
+### S3 Key Layout
+
+```
+mailex-parquet/
+  email_event_extraction/
+    split=train/part-0.parquet   (7,207 rows)
+    split=dev/part-0.parquet     (1,007 rows)
+    split=test/part-0.parquet      (945 rows)
+```
 
 ---
 
 ## Prerequisites
 
-- **Docker Desktop** (or Docker Engine + Compose plugin) — v24+
-- **Python 3.9+** on the host (only for running `tests/generate_fixtures.py` and `tests/run_negative_tests.py` outside Docker)
-- `pandas` and `boto3` installed on the host for the test scripts: `pip install pandas boto3`
+| Requirement | Version tested |
+|------------|---------------|
+| Docker Desktop | 4.x |
+| Docker Compose v2 | bundled with Docker Desktop |
+| (optional) Python 3.11+ | for running test scripts on the host |
+
+No other local dependencies are required — the Dockerfile installs everything inside the container.
 
 ---
 
 ## Setup
 
-### 1. Copy the environment file
-
 ```bash
+# 1. Clone / navigate to this folder
+cd stage-2-csv-to-minio
+
+# 2. Copy the example env file (defaults work out of the box)
 cp .env.example .env
 ```
 
-The default values in `.env.example` work **out of the box** for local development.  
-You only need to change them if you want different credentials or ports.
+The `.env` file contains:
 
-### 2. Start Docker Desktop
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MINIO_ROOT_USER` | `minioadmin` | MinIO / Silo root username |
+| `MINIO_ROOT_PASSWORD` | `minioadmin123` | MinIO / Silo root password |
+| `MINIO_BUCKET` | `mailex-parquet` | S3 bucket name |
+| `AIRFLOW_ADMIN_USER` | `admin` | Airflow UI username |
+| `AIRFLOW_ADMIN_PASSWORD` | `admin` | Airflow UI password |
+| `POSTGRES_USER` | `airflow` | Airflow metadata DB user |
+| `POSTGRES_PASSWORD` | `airflow_dhap42_pw` | Airflow metadata DB password |
 
-Make sure the Docker daemon is running.
-
-### 3. Bring up the stack
-
-```bash
-docker compose up -d
-```
-
-This will:
-1. Build the custom Airflow image (adds pandas, pyarrow, PyYAML, boto3)
-2. Build the MinIO image (downloads the server binary from GitHub Releases)
-3. Start PostgreSQL (Airflow metadata)
-4. Start MinIO (S3 API on :9020, web console on :9021)
-5. Run `mc-init` to create the `mailex-parquet` bucket via boto3 (idempotent)
-6. Run `airflow-init` to migrate the DB and create the admin user
-7. Start the Airflow webserver and scheduler
-
-**First build takes ~5–10 minutes** (pulling images + pip install).
-
-### 4. Wait for healthy
-
-```bash
-docker compose ps        # wait until all services are (healthy)
-```
-
-Or watch logs:
-```bash
-docker compose logs -f airflow-webserver
-```
+> **Never commit a populated `.env` with real secrets.** `.gitignore` already excludes `.env`.
 
 ---
 
-## URLs and Default Logins
+## Starting the Stack
 
-| Service | URL | Username | Password |
-|---------|-----|----------|----------|
-| Airflow UI | http://localhost:8082 | admin | admin |
-| MinIO console | http://localhost:9021 | minioadmin | minioadmin123 |
+```bash
+# Build images and start all services in the background
+docker compose up -d --build
 
-> **Note**: If you changed `AIRFLOW_WEBSERVER_PORT`, `MINIO_CONSOLE_PORT` in `.env`, use those ports instead.
+# Watch logs (Ctrl-C to exit)
+docker compose logs -f
+```
+
+Startup order (enforced by `depends_on` + healthchecks):
+
+1. `postgres-meta` → healthy
+2. `minio` → healthy  ← S3 API + web console
+3. `mc-init` → runs once, creates the `mailex-parquet` bucket
+4. `airflow-init` → runs once, migrates DB + creates admin user
+5. `airflow-webserver` + `airflow-scheduler` → start
+
+Allow ~90 seconds on first run for all services to become healthy.
+
+```bash
+# Check status
+docker compose ps
+```
+
+All services should show `healthy` or `exited (0)` for the one-shot containers.
 
 ---
 
-## How to Trigger the DAG
+## Airflow UI
 
-### Via Airflow UI
-1. Open http://localhost:8082
-2. Log in with admin / admin
-3. Find `csv_to_parquet_minio` in the DAG list
-4. Click the **▶ Trigger DAG** button
-5. Optionally override params (csv_path, contract_path) in the JSON conf
+Open **http://localhost:8082** in your browser.
 
-### Via Airflow CLI (inside the container)
+- **Username:** `admin`  
+- **Password:** `admin`
+
+The DAG `csv_to_parquet_minio` appears in the list. It is paused by default; unpause it before triggering.
+
+---
+
+## MinIO Console
+
+Open **http://localhost:9021** in your browser.
+
+- **Username:** `minioadmin`  
+- **Password:** `minioadmin123`
+
+After `mc-init` runs, you will see the `mailex-parquet` bucket listed under **Buckets**. It is empty until you trigger the DAG.
+
+> The MinIO service uses **pgsty/silo** (`docker.io/pgsty/silo`), a maintained drop-in fork of MinIO that keeps the same environment variables, the same S3 API, and the same web console.
+
+---
+
+## Triggering the DAG
+
+### Option A — Airflow UI
+
+1. Go to **http://localhost:8082**
+2. Find `csv_to_parquet_minio`, click the **▶ Trigger** button
+3. Leave the JSON config blank (uses `dags/extraction/sample.csv`)
+4. Click **Trigger**
+
+### Option B — CLI
+
 ```bash
-# Good CSV (default)
+# Happy path (uses sample.csv by default)
 docker exec dhap42_airflow_scheduler \
   airflow dags trigger csv_to_parquet_minio
 
-# Override CSV path (for negative tests)
+# Trigger with a specific CSV (replace path as needed)
 docker exec dhap42_airflow_scheduler \
   airflow dags trigger csv_to_parquet_minio \
-  --conf '{"csv_path":"/opt/airflow/tests/bad_missing_column.csv"}'
+  --conf '{"csv_path": "/opt/airflow/dags/extraction/sample.csv"}'
 
-# Unpause if needed
+# Trigger with the BAD CSV (validate_contract should fail)
 docker exec dhap42_airflow_scheduler \
-  airflow dags unpause csv_to_parquet_minio
+  airflow dags trigger csv_to_parquet_minio \
+  --conf '{"csv_path": "/opt/airflow/tests/bad_missing_column.csv"}'
 ```
 
-### Via REST API
+### Watch task progress
+
 ```bash
-curl -s -u admin:admin \
-  -H "Content-Type: application/json" \
-  -X POST http://localhost:8082/api/v1/dags/csv_to_parquet_minio/dagRuns \
-  -d '{"conf": {}}'
+# Poll DAG run status
+docker exec dhap42_airflow_scheduler \
+  airflow dags list-runs -d csv_to_parquet_minio
 ```
+
+A successful run shows all 4 tasks as `success`. A bad-CSV run shows `validate_contract` as `failed` and downstream tasks as `upstream_failed`.
 
 ---
 
-## How to Run the Negative Tests
+## Verifying Objects in MinIO
 
-### Step 1 — Generate fixtures (run once, on the host)
+### In the console
+
+1. Open **http://localhost:9021** → **Buckets** → `mailex-parquet`
+2. Browse to `email_event_extraction/`
+3. After a successful run you should see three folders: `split=train/`, `split=dev/`, `split=test/`
+4. Each folder contains a single `part-0.parquet` file
+
+### Via CLI script (runs inside the scheduler container)
+
 ```bash
-python tests/generate_fixtures.py
-```
-
-This creates `tests/bad_missing_column.csv` and `tests/fixtures/b_*.csv` through `i_*.csv`.
-
-### Step 2 — Run the test suite
-```bash
-python tests/run_negative_tests.py
+docker exec dhap42_airflow_scheduler \
+  python3 /opt/airflow/tests/verify_s3.py
 ```
 
 Expected output:
-```
-[a] ✓ PASS  Missing event_type + bad num_arguments
-[b] ✓ PASS  Renamed column
-[c] ✓ PASS  Extra column
-[d] ✓ PASS  Wrong dtype in num_arguments
-[e] ✓ PASS  Null in non-nullable thread_file
-[f] ✓ PASS  Invalid event_type value
-[g] ✓ PASS  Invalid split value
-[h] ✓ PASS  Malformed trigger_indices
-[i] ✓ PASS  Empty file / header only
 
-9/9 tests passed.
 ```
-
-Each test asserts:
-- DAG run **state = failed**
-- `validate_contract` task **state = failed**
-- `transform` and `write_parquet_to_minio` show **upstream_failed**
-- MinIO object count **has not increased**
+=== Listing objects in s3://mailex-parquet/email_event_extraction/ ===
+Found 3 object(s):
+  email_event_extraction/split=dev/part-0.parquet      (XX,XXX bytes)
+  email_event_extraction/split=test/part-0.parquet     (XX,XXX bytes)
+  email_event_extraction/split=train/part-0.parquet    (XX,XXX bytes)
+...
+=== ALL ASSERTIONS PASSED ===
+✓ 3 Parquet partition files (train / dev / test)
+✓ 9,159 total rows (matches source CSV)
+✓ Each file contains exactly one split value
+```
 
 ---
 
-## Schema Contract
+## Negative Tests
 
-The contract is defined in `schema_contract.yaml` (mounted into Airflow at `/opt/airflow/config/`).
+The test suite validates that all 9 schema-contract violations are correctly rejected.
 
-### Enforced Rules
+### Step 1 — Regenerate fixtures (once, or after changing the contract)
 
-| Rule | Behaviour on Violation |
-|------|----------------------|
-| Missing column | FAIL |
-| Renamed column | FAIL (detected as missing + extra) |
-| Extra column | FAIL (`allow_extra_columns: false`) |
-| Wrong column order | FAIL (`enforce_column_order: true`) |
-| Wrong type (e.g. string in int column) | FAIL (strict, no coercion) |
-| Null in non-nullable column | FAIL |
-| Value not in `allowed_values` | FAIL |
-| Value not matching `regex` | FAIL |
-| `num_arguments` < 0 | FAIL |
-| `sentence_text` blank | FAIL |
-| Duplicate `id` | FAIL |
-| Empty file / header only | FAIL |
+```bash
+docker exec dhap42_airflow_scheduler \
+  python3 /opt/airflow/tests/generate_fixtures.py
+```
 
-All violations are **collected** before raising — you see the full list in one error.
+### Step 2 — Run the negative tests
 
-### Column Summary
+```bash
+docker exec dhap42_airflow_scheduler \
+  python3 /opt/airflow/tests/run_negative_tests.py
+```
 
-| # | Column | Type | Nullable | Key Rules |
-|---|--------|------|----------|-----------|
-| 1 | id | integer | No | Unique |
-| 2 | thread_file | string | No | Ends with `.json` |
-| 3 | split | string | No | Allowed: train, dev, test |
-| 4 | turn_id | string | No | Pattern: `^turn_\d+$` |
-| 5 | event_type | string | No | 12 allowed values |
-| 6 | trigger_text | string | **Yes** | — |
-| 7 | trigger_indices | string | **Yes** | When present: `^\d+(\s\d+)*$` |
-| 8 | extras | string | **Yes** | — |
-| 9 | sentence_text | string | No | Non-empty |
-| 10 | num_arguments | integer | No | >= 0 |
+Expected output:
+
+```
+Running 9 negative-test cases...
+  [PASS] a_missing_column   — SchemaError: missing required columns: ['event_type']
+  [PASS] b_renamed_column   — SchemaError: ...
+  ...
+  [PASS] i_empty_file       — SchemaError: file has 0 rows ...
+9 / 9 passed.
+```
+
+### Bad-CSV DAG trigger
+
+Trigger the DAG with the bad CSV and inspect the `validate_contract` task log:
+
+```bash
+# Trigger
+docker exec dhap42_airflow_scheduler \
+  airflow dags trigger csv_to_parquet_minio \
+  --conf '{"csv_path": "/opt/airflow/tests/bad_missing_column.csv"}'
+
+# After the run fails, get the run_id
+docker exec dhap42_airflow_scheduler \
+  airflow dags list-runs -d csv_to_parquet_minio
+
+# View the validate_contract task logs
+docker exec dhap42_airflow_scheduler \
+  airflow tasks logs csv_to_parquet_minio validate_contract <run_id>
+```
+
+You should see `SchemaError: missing required columns: ['event_type']` and **nothing written to MinIO** (verify with `verify_s3.py` — it will show 0 or 3 objects depending on whether a previous good run existed).
 
 ---
 
-## Partitioning Rationale
+## Idempotency
 
-The dataset is partitioned by **`split`** (train / dev / test).
+Re-trigger the DAG with the same CSV. The `write_parquet_to_minio` task deletes all existing objects under the prefix before writing, so the bucket always ends up with exactly 3 objects — no accumulation.
 
-**Why `split`?**
-- Exactly **3 distinct values** → 3 Parquet files, manageable and predictable
-- **No nulls** → Hive-style partitioning is safe
-- **Reasonably balanced** (≈78% / 11% / 10%)
-- Downstream ML workflows almost always filter by split first
+```bash
+# Trigger a second time
+docker exec dhap42_airflow_scheduler \
+  airflow dags trigger csv_to_parquet_minio
 
-**Why not `event_type`?**
-- 12 values, heavily unbalanced ("O" = 789 rows, others range 85–1,600)
-- Produces 12 small, uneven files with poor read efficiency
-
-**Why not `thread_file`?**
-- 1,500 distinct values → 1,500 tiny Parquet files (~6 rows each)
-- Anti-pattern: hurts object-store list performance and query planning
+# After completion, verify still exactly 3 objects
+docker exec dhap42_airflow_scheduler \
+  python3 /opt/airflow/tests/idempotency_check.py
+```
 
 ---
 
 ## Folder Layout
 
 ```
-project-DHAP-42-email-event-extraction/
-│
-├── Dockerfile                      # Airflow + pandas/pyarrow/PyYAML/boto3/moto
-├── Dockerfile.minio                # Real MinIO server (GitHub Releases binary)
-├── docker-compose.yaml             # All services
-├── .env.example                    # Template (copy to .env)
-├── .gitignore
-├── manifest.yaml                   # Dataset metadata
-├── README.md
-│
-├── config/
-│   └── schema_contract.yaml        # Validation contract, mounted into Airflow
-│
+stage-2-csv-to-minio/
+├── mailex_email_event_extraction/
+│   ├── manifest.yaml            # Dataset metadata (source, schema, owner)
+│   └── schema_contract.yaml     # Column rules validated by validate_contract task
 ├── dags/
-│   ├── csv_to_parquet_minio.py     # The pipeline DAG
+│   ├── csv_to_parquet_minio.py  # Airflow DAG (do not modify)
 │   └── extraction/
-│       └── sample.csv              # The 9,168-row MailEx CSV
-│
+│       └── sample.csv           # MailEx dataset (9,168 rows)
 ├── tests/
-│   ├── bad_missing_column.csv      # Fixture (a): missing event_type + bad dtype
-│   ├── generate_fixtures.py        # Generates fixtures b–i from good CSV
-│   ├── run_negative_tests.py       # Runs all 9 negative tests
-│   └── fixtures/
-│       ├── b_renamed_column.csv
-│       ├── c_extra_column.csv
-│       ├── d_wrong_dtype.csv
-│       ├── e_null_nonnullable.csv
-│       ├── f_invalid_event_type.csv
-│       ├── g_invalid_split.csv
-│       ├── h_bad_trigger_indices.csv
-│       └── i_empty_file.csv
-│
-└── docs/
-    └── evidence/                   # Screenshots and log excerpts
+│   ├── bad_missing_column.csv   # Fixture: triggers validate_contract failure
+│   ├── fixtures/                # b_renamed_column.csv … i_empty_file.csv
+│   ├── generate_fixtures.py     # Generates fixtures from sample.csv
+│   ├── run_negative_tests.py    # Runs 9 negative test cases
+│   ├── verify_s3.py             # Reads Parquet back from MinIO, asserts counts
+│   ├── idempotency_check.py     # Asserts exactly 3 objects after re-run
+│   ├── verify_pipeline.py       # Full end-to-end verification script
+│   └── inspect_contract.py     # Prints parsed schema_contract.yaml
+├── docs/
+│   ├── evidence/               # Fresh logs from the verified run
+│   └── DEMO_SCRIPT.md          # 5-7 min demo video script
+├── docker-compose.yaml
+├── Dockerfile                  # Airflow image (pandas, pyarrow, PyYAML, boto3)
+├── .env.example
+├── .gitignore
+└── README.md                   # This file
 ```
-
----
-
-## Assumptions
-
-1. **Port defaults**: Airflow :8082, MinIO API :9020, MinIO console :9021 — chosen to avoid DHAP-34's :8080 and :5433. Change via `.env` if needed.
-2. **`bad_missing_column.csv`** was not provided as a file — it is generated by `generate_fixtures.py`. The spec describes its content (missing `event_type`, bad `num_arguments`); this script faithfully produces it.
-3. **Wrong column order** fails the DAG (`enforce_column_order: true`). This is the safer choice — a silently reordered schema could cause incorrect downstream partition values or type mismatches.
-4. **Exact duplicate detection** ignores `id` (as specified) and keeps the first occurrence (lowest id).  The 9 known duplicates in the dataset are dropped.
-5. **Audit columns** (`ingested_at`, `run_id`) are appended after validation so they never interfere with schema checks.
-6. **Airflow version**: 2.9.3 (same as DHAP-34 for operational consistency).
-7. **MinIO version**: resolved at build time by querying the GitHub Releases API for the latest release with binary assets and installing the amd64 DEB package (`dpkg -i`). The actual version baked into the image is printed in `docker compose build` output — `RELEASE.2025-09-07T16-13-09Z` at time of writing. No Docker Hub org-image pull required; only `debian:12-slim` (official library image) is needed.
-8. **Temp files** live at `/tmp/dhap42_<run_id>/`. If a container is killed mid-run, these may persist; they are harmless and cleaned up on the next successful run.
-9. **`AIRFLOW__CORE__FERNET_KEY`**: left blank in this local-dev setup. For production, generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
 
 ---
 
 ## Troubleshooting
 
-### Port already in use
-```
-Error: Bind for 0.0.0.0:8082 failed: port is already allocated
-```
-Change `AIRFLOW_WEBSERVER_PORT` (or `MINIO_API_PORT` / `MINIO_CONSOLE_PORT`) in `.env` and restart.
+### Containers not starting
 
-### Permission errors on Linux (volumes)
 ```bash
-echo "AIRFLOW_UID=$(id -u)" >> .env
-docker compose down && docker compose up -d
+docker compose logs postgres-meta
+docker compose logs minio
+docker compose logs airflow-init
 ```
 
-### MinIO bucket not created
-Check `mc-init` logs:
+### MinIO console not accessible
+
+Verify the `minio` container is healthy:
+
 ```bash
-docker compose logs mc-init
+docker compose ps minio
+docker compose logs minio
 ```
-The `mc-init` container waits for MinIO health then creates the bucket. If it exited before MinIO was ready, restart it:
+
+The console is at **http://localhost:9021**. The API is at **http://localhost:9020**.
+
+### DAG not visible in Airflow UI
+
+The scheduler parses DAGs from `./dags/`. If the file has a syntax error, it won't appear:
+
 ```bash
-docker compose restart mc-init
+docker exec dhap42_airflow_scheduler \
+  airflow dags list
 ```
 
-### Airflow connection to MinIO not working
-Verify the `AIRFLOW_CONN_MINIO_S3` value in `.env`. It must be:
-```
-aws://minioadmin:minioadmin123@/?endpoint_url=http%3A%2F%2Fminio%3A9000
-```
-The `minio` hostname resolves inside Docker Compose; from the host, use `localhost:9020`.
+Check scheduler logs for parse errors:
 
-### DAG not appearing in Airflow UI
 ```bash
-docker exec dhap42_airflow_scheduler airflow dags list
-docker exec dhap42_airflow_scheduler airflow dags report
+docker compose logs airflow-scheduler | grep -i error
 ```
-Check for import errors:
+
+### Reset everything (clean slate)
+
 ```bash
-docker exec dhap42_airflow_scheduler airflow dags list-import-errors
+# Stop all containers AND delete volumes (data is lost)
+docker compose down -v
+
+# Rebuild from scratch
+docker compose up -d --build
 ```
 
-### Re-running from scratch
-```bash
-docker compose down -v   # removes volumes (MinIO data + Airflow DB)
-docker compose up -d
-```
+### Port conflicts
 
----
+Default ports:
 
-## Verification Checklist
+| Service | Host port |
+|---------|----------|
+| Airflow UI | 8082 |
+| MinIO S3 API | 9020 |
+| MinIO console | 9021 |
 
-- [ ] `docker compose ps` — all services healthy
-- [ ] MinIO console :9021 — `mailex-parquet` bucket visible (empty)
-- [ ] Trigger DAG → 4 green tasks → 3 parquet objects in MinIO
-- [ ] Row count via `pyarrow.parquet.read_table()` = **9,159** (9,168 − 9 duplicates)
-- [ ] Negative tests: `python tests/run_negative_tests.py` → 9/9 pass
-- [ ] Re-trigger good CSV → same 3 objects, same row counts (idempotent)
+If these conflict with other services, edit the corresponding `*_PORT` variables in `.env`.

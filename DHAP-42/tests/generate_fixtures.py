@@ -1,7 +1,7 @@
 """
 generate_fixtures.py
 ====================
-DHAP-42 — Negative Test Fixture Generator
+Stage 2 — Negative Test Fixture Generator
 
 Generates all CSV fixtures used by the negative tests.  Run this ONCE before
 running run_negative_tests.py (or the Docker compose stack).

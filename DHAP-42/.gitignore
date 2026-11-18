@@ -1,4 +1,4 @@
-# .gitignore — DHAP-42
+# .gitignore — Stage 2: CSV → MinIO Parquet Pipeline
 # ---------------------------------------------------------------------------
 
 # Environment / secrets
@@ -16,6 +16,9 @@ build/
 .venv/
 venv/
 env/
+
+# Build artifact directories
+.dist/
 
 # Airflow generated files
 logs/

@@ -1,4 +1,4 @@
-"""verify_s3.py — Check Parquet files written to moto S3 by the DAG."""
+"""verify_s3.py — Check Parquet files written to MinIO by the DAG."""
 import boto3
 import io
 import pandas as pd

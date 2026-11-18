@@ -1,6 +1,6 @@
 # Springer Capital Projects
 
-Internal data engineering and analytics projects for **Glynac AI / Springer Capital**.
+Internal data engineering and analytics projects for **Springer Capital**.
 
 ---
 
@@ -8,22 +8,22 @@ Internal data engineering and analytics projects for **Glynac AI / Springer Capi
 
 ```
 Springer_Capital_Projects/
-  Email_Event_Extraction_DHAP_34/   DHAP-34 v1  Original pipeline layout
-  Stage 1/                          DHAP-34 v2  Restructured & verified pipeline (current)
-  DHAP-42/                          DHAP-42     CSV -> MinIO Parquet ingestion pipeline
+  Email_Event_Extraction_DHAP_34/   Stage 1 v1  Original pipeline layout
+  Stage 1/                          Stage 1 v2  Restructured & verified pipeline (current)
+  DHAP-42/                          Stage 2     CSV -> MinIO Parquet ingestion pipeline
 ```
 
-| Folder | Jira | Version | Description |
-|--------|------|---------|-------------|
-| [`Email_Event_Extraction_DHAP_34/`](./Email_Event_Extraction_DHAP_34/) | DHAP-34 | v1 | Original Airflow + PostgreSQL ingestion pipeline for the MailEx dataset. First working version; kept for reference. |
-| [`Stage 1/`](./Stage%201/) | DHAP-34 | v2 (current) | Restructured, fully verified, and production-ready version of the same DHAP-34 pipeline. See below for what changed. |
-| [`DHAP-42/`](./DHAP-42/) | DHAP-42 | — | Airflow DAG that reads the same MailEx CSV and writes partitioned Parquet files to a MinIO S3-compatible object store. |
+| Folder | Stage | Version | Description |
+|--------|-------|---------|-------------|
+| [`Email_Event_Extraction_DHAP_34/`](./Email_Event_Extraction_DHAP_34/) | Stage 1 | v1 | Original Airflow + PostgreSQL ingestion pipeline for the MailEx dataset. First working version; kept for reference. |
+| [`Stage 1/`](./Stage%201/) | Stage 1 | v2 (current) | Restructured, fully verified, and production-ready version of the same pipeline. See below for what changed. |
+| [`DHAP-42/`](./DHAP-42/) | Stage 2 | current | Airflow DAG that reads the same MailEx CSV and writes partitioned Parquet files to a MinIO (pgsty/silo) S3-compatible object store. |
 
 ---
 
-## DHAP-34 — What changed between v1 and Stage 1
+## Stage 1 — What changed between v1 and v2
 
-`Email_Event_Extraction_DHAP_34/` was the first working version submitted for DHAP-34.
+`Email_Event_Extraction_DHAP_34/` was the first working version submitted for Stage 1.
 `Stage 1/` is the **restructured and fully end-to-end verified** successor. It is the
 version to use for any new work on this dataset.
 
@@ -31,7 +31,7 @@ version to use for any new work on this dataset.
 |------|--------------------------------------|------------------------|
 | **Folder layout** | `config/` holds YAML files; `sql/` holds DDL | Flattened into `email_event_extraction/` subfolder — manifest, schema, and DDL all in one place |
 | **Path references** | Hardcoded to old `config/` and `sql/` paths | All paths updated and consistent throughout DAG, docker-compose, and scripts |
-| **manifest.yaml status** | `status: validated` | Correctly reflects DHAP-34 analysis status: `status: "."`, `status2: "pending"` |
+| **manifest.yaml status** | `status: validated` | Correctly reflects analysis status: `status: "."`, `status2: "pending"` |
 | **DAG status awareness** | No status check | DAG reads `manifest.yaml` at runtime and logs a WARNING when `status2 = pending`; run still continues |
 | **Event types** | 10 event types | 11 event types — added `Amend_Action_Data` (3 rows confirmed in data) |
 | **DDL manual-run example** | Used `/docker-entrypoint-initdb.d/` path (incorrect) | Corrected to `docker compose exec -T postgres-target psql` via stdin |
@@ -41,7 +41,7 @@ version to use for any new work on this dataset.
 
 ---
 
-## Quick Start — Stage 1 (DHAP-34 current)
+## Quick Start — Stage 1 (current)
 
 ```bash
 # 1. Generate the flat CSV from raw JSON (run once on your machine)
@@ -75,20 +75,20 @@ docker compose exec postgres-target \
 
 ---
 
-## Quick Start — DHAP-42 (CSV → MinIO Parquet)
+## Quick Start — Stage 2 (CSV → MinIO Parquet)
 
 ```bash
 # 1. Copy the env template
 cd DHAP-42/
 cp .env.example .env
 
-# 2. Build and start the stack (Airflow + MinIO + Postgres)
+# 2. Build and start the stack (Airflow + MinIO/Silo + Postgres metadata)
 docker compose up -d --build
 #    First build: ~5-10 min
 
 # 3. Services
 #    Airflow UI  ->  http://localhost:8082   (admin / admin)
-#    MinIO UI    ->  http://localhost:9021   (see .env.example for credentials)
+#    MinIO UI    ->  http://localhost:9021   (minioadmin / minioadmin123)
 
 # 4. Trigger the pipeline
 docker compose exec airflow-scheduler airflow dags trigger csv_to_parquet_minio
@@ -102,15 +102,15 @@ docker compose exec airflow-scheduler python3 /opt/airflow/tests/run_negative_te
 ```
 
 > See [`DHAP-42/README.md`](./DHAP-42/README.md) for the full runbook, architecture
-> diagram, and verification checklist.
+> diagram, demo script, and verification checklist.
 
-### DHAP-42 Key Facts
+### Stage 2 Key Facts
 
 | Item | Detail |
 |------|--------|
 | Dataset | MailEx Email-Event-Extraction (EMNLP 2023) — 9,168 rows, 10 columns |
 | Pipeline | `read_csv -> validate_contract -> transform -> write_parquet_to_minio` |
-| Object store | MinIO `RELEASE.2025-09-07T16-13-09Z` (web console on :9021) |
+| Object store | pgsty/silo (MinIO-compatible fork, web console on :9021) |
 | Partitioning | By `split` column — `split=train / dev / test` Parquet files |
 | Compression | Snappy |
 | Idempotency | Existing partition objects deleted before each write |
@@ -125,10 +125,10 @@ credentials are stored in this repository. Copy it to `.env` and fill in your ow
 values before running the stack:
 
 ```bash
-# Stage 1 (DHAP-34)
+# Stage 1
 cp "Stage 1/.env.example" "Stage 1/.env"
 
-# DHAP-42
+# Stage 2
 cp DHAP-42/.env.example DHAP-42/.env
 ```
 
@@ -167,4 +167,4 @@ License: [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
 
 ---
 
-*Owner: Shruti Agarwal | Org: Glynac AI / Springer Capital*
+*Owner: Shruti Agarwal | Springer Capital*

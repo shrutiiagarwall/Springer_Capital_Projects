@@ -1,5 +1,5 @@
 import yaml
-with open('/opt/airflow/config/schema_contract.yaml') as f:
+with open('/opt/airflow/mailex_email_event_extraction/schema_contract.yaml') as f:
     c = yaml.safe_load(f)
 print('global:', c.get('global'))
 print()

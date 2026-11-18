@@ -1,5 +1,5 @@
 # manifest.yaml
-# DHAP-42 — Local CSV → MinIO Parquet Ingestion Pipeline
+# Stage 2 — Local CSV → MinIO Parquet Ingestion Pipeline
 # ---------------------------------------------------------------------------
 # Metadata describing the MailEx Email-Event-Extraction dataset and the
 # pipeline that ingests it.
@@ -16,7 +16,7 @@ dataset:
     paper: "MailEx: Email Event and Argument Extraction (EMNLP 2023)"
     repo: "https://github.com/salokr/Email-Event-Extraction"
     license: "Research use (see paper)"
-  owner: "DHAP-42 / Springer Capital intern project"
+  owner: "Stage 2 / Springer Capital intern project"
   status: "active"
   version: "1.0.0"
 

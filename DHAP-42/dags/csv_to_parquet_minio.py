@@ -1,7 +1,7 @@
 """
 csv_to_parquet_minio.py
 =======================
-Airflow DAG — DHAP-42 (Springer Capital)
+Airflow DAG — Stage 2 (Springer Capital)
 
 Purpose
 -------
@@ -107,7 +107,7 @@ _DEFAULT_CSV_PATH = os.getenv(
 )
 _DEFAULT_CONTRACT_PATH = os.getenv(
     "MAILEX_CONTRACT_PATH",
-    "/opt/airflow/config/schema_contract.yaml",
+    "/opt/airflow/mailex_email_event_extraction/schema_contract.yaml",
 )
 _MINIO_CONN_ID = "minio_s3"
 _MINIO_BUCKET = os.getenv("MINIO_BUCKET", "mailex-parquet")
@@ -121,13 +121,13 @@ _S3_PREFIX = "email_event_extraction"
 @dag(
     dag_id="csv_to_parquet_minio",
     description=(
-        "DHAP-42 — Ingest MailEx Email-Event-Extraction CSV into MinIO "
+        "Stage 2 — Ingest MailEx Email-Event-Extraction CSV into MinIO "
         "as Snappy-compressed Parquet, partitioned by split."
     ),
     schedule=None,
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
-    tags=["dhap-42", "mailex", "email-events", "parquet", "minio", "ingestion"],
+    tags=["stage-2", "mailex", "email-events", "parquet", "minio", "ingestion"],
     doc_md=__doc__,
     params={
         "csv_path": Param(
@@ -233,7 +233,7 @@ def csv_to_parquet_minio() -> None:  # noqa: C901
         if not contract_path.exists():
             raise AirflowFailException(
                 f"Schema contract not found: {contract_path}\n"
-                "Is config/schema_contract.yaml mounted into the container?"
+                "Is mailex_email_event_extraction/schema_contract.yaml mounted into the container?"
             )
 
         with open(contract_path, encoding="utf-8") as f:

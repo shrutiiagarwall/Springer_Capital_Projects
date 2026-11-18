@@ -1,34 +1,34 @@
 # docker-compose.yaml
-# DHAP-42 — CSV → MinIO Parquet Ingestion Pipeline
+# Stage 2 — CSV → MinIO Parquet Ingestion Pipeline
 #
 # Services
 # --------
 #   postgres-meta       — PostgreSQL used exclusively by Airflow as its
 #                         metadata DB. Do NOT point your DAG at this DB.
-#   minio               — S3-compatible object store (API :9020, UI :9021).
-#   mc-init             — One-shot MinIO Client container that creates the
-#                         target bucket on startup (idempotent).
-#   airflow-init        — One-shot init: db migrate, admin user, no extra
-#                         connections needed (MinIO conn is via env var).
+#   minio               — S3-compatible object store (pgsty/silo, a maintained
+#                         MinIO fork). API :9020, web console :9021.
+#   mc-init             — One-shot container that creates the target bucket on
+#                         startup via boto3 (idempotent).
+#   airflow-init        — One-shot init: db migrate + admin user creation.
 #   airflow-webserver   — Airflow web UI (http://localhost:8082)
 #   airflow-scheduler   — LocalExecutor scheduler (no Celery/Redis needed)
 #
 # Volume mounts
 # -------------
-#   ./dags      → /opt/airflow/dags        (DAG + sample.csv)
-#   ./config    → /opt/airflow/config      (schema_contract.yaml)
-#   ./tests     → /opt/airflow/tests       (negative test fixtures)
+#   ./dags                        → /opt/airflow/dags
+#   ./mailex_email_event_extraction → /opt/airflow/mailex_email_event_extraction
+#   ./tests                       → /opt/airflow/tests
 #
-# Port mapping (avoids DHAP-34 conflicts)
+# Port mapping (avoids Stage 1 conflicts)
 # ----------------------------------------
-#   DHAP-34  →  Airflow :8080,  Postgres target :5433
-#   DHAP-42  →  Airflow :8082,  MinIO API :9020,  MinIO console :9021
+#   Stage 1 →  Airflow :8080,  Postgres target :5433
+#   Stage 2 →  Airflow :8082,  MinIO API :9020,  MinIO console :9021
 #
 # Quick start
 # -----------
 #   cp .env.example .env        # review defaults (they work out of the box)
-#   docker compose up -d        # build image + start all services
-#   # Airflow UI   → http://localhost:8082  (admin / admin)
+#   docker compose up -d --build
+#   # Airflow UI    → http://localhost:8082  (admin / admin)
 #   # MinIO console → http://localhost:9021  (minioadmin / minioadmin123)
 #
 # All secrets are read from the .env file. Never commit a populated .env.
@@ -61,7 +61,7 @@ x-airflow-common: &airflow-common
     AIRFLOW_CONN_MINIO_S3: ${AIRFLOW_CONN_MINIO_S3}
 
     # Expose config paths so DAG tasks can read them without hardcoding
-    MAILEX_CONTRACT_PATH: /opt/airflow/config/schema_contract.yaml
+    MAILEX_CONTRACT_PATH: /opt/airflow/mailex_email_event_extraction/schema_contract.yaml
     MAILEX_CSV_PATH: /opt/airflow/dags/extraction/sample.csv
     MINIO_BUCKET: ${MINIO_BUCKET:-mailex-parquet}
 
@@ -70,7 +70,7 @@ x-airflow-common: &airflow-common
 
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./config:/opt/airflow/config
+    - ./mailex_email_event_extraction:/opt/airflow/mailex_email_event_extraction
     - ./tests:/opt/airflow/tests
     - airflow_logs:/opt/airflow/logs
 
@@ -102,18 +102,16 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
-  # minio: Real MinIO object store, built from Dockerfile.minio.
-  # The binary is downloaded from GitHub Releases (avoids Docker Hub org-image
-  # pull restrictions in this environment — only official/library images work).
+  # minio: pgsty/silo — a maintained, drop-in MinIO fork available on
+  # Docker Hub. Keeps the same MINIO_ROOT_USER / MINIO_ROOT_PASSWORD env vars,
+  # the same S3 API, and the same --console-address flag.
   #
   # API      → http://localhost:${MINIO_API_PORT:-9020}  (S3-compatible)
   # Console  → http://localhost:${MINIO_CONSOLE_PORT:-9021}  (web UI)
   #            Login: MINIO_ROOT_USER / MINIO_ROOT_PASSWORD from .env
   # --------------------------------------------------------------------------
   minio:
-    build:
-      context: .
-      dockerfile: Dockerfile.minio
+    image: docker.io/pgsty/silo:latest
     container_name: dhap42_minio
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -134,7 +132,6 @@ services:
 
   # --------------------------------------------------------------------------
   # mc-init: Creates the S3 bucket via boto3 (idempotent).
-  # Works with both moto server and real MinIO — same S3 API.
   # --------------------------------------------------------------------------
   mc-init:
     build:
@@ -185,15 +182,13 @@ services:
             s3.create_bucket(Bucket=bucket)
             print(f"Bucket '{bucket}' created.")
         except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
-                print(f"Bucket '{bucket}' already exists — OK.")
+            if e.response["Error"]["Code"] in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                print(f"Bucket '{bucket}' already exists — skipping.")
             else:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                raise
 
-        resp = s3.list_buckets()
-        print("Buckets:", [b["Name"] for b in resp.get("Buckets", [])])
+        buckets = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+        print(f"Buckets: {buckets}")
         print("=== [mc-init] Done. ===")
         PYEOF
     depends_on:
@@ -202,9 +197,7 @@ services:
     restart: "no"
 
   # --------------------------------------------------------------------------
-  # airflow-init: One-shot initialisation.
-  # Runs db migrate and creates the admin user.
-  # The MinIO S3 connection is already available via AIRFLOW_CONN_MINIO_S3.
+  # airflow-init: One-shot DB migration + admin user creation.
   # --------------------------------------------------------------------------
   airflow-init:
     <<: *airflow-common
@@ -213,11 +206,8 @@ services:
     command:
       - -c
       - |
-        set -e
-
         echo "=== [airflow-init] Running Airflow DB migrations ==="
         airflow db migrate
-
         echo "=== [airflow-init] Creating admin user ==="
         airflow users create \
           --username "${AIRFLOW_ADMIN_USER:-admin}" \
@@ -225,65 +215,58 @@ services:
           --firstname Admin \
           --lastname User \
           --role Admin \
-          --email admin@example.com \
-          || echo "Admin user already exists, skipping."
-
+          --email admin@example.com || true
         echo "=== [airflow-init] Done. MinIO connection available via env var AIRFLOW_CONN_MINIO_S3 ==="
-
-    environment:
-      <<: *airflow-common-env
-      _AIRFLOW_DB_MIGRATE: "true"
-      _AIRFLOW_WWW_USER_CREATE: "true"
-      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
-      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
     depends_on:
       postgres-meta:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: "no"
 
   # --------------------------------------------------------------------------
-  # airflow-webserver: Airflow UI on http://localhost:8082
+  # airflow-webserver: Airflow UI on host port 8082
   # --------------------------------------------------------------------------
   airflow-webserver:
     <<: *airflow-common
     container_name: dhap42_airflow_webserver
     command: webserver
     ports:
-      - "${AIRFLOW_WEBSERVER_PORT:-8082}:8080"
+      - "${AIRFLOW_PORT:-8082}:8080"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     depends_on:
+      postgres-meta:
+        condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-      minio:
-        condition: service_healthy
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
-  # airflow-scheduler: LocalExecutor scheduler (no Celery/Redis)
+  # airflow-scheduler: LocalExecutor scheduler
   # --------------------------------------------------------------------------
   airflow-scheduler:
     <<: *airflow-common
     container_name: dhap42_airflow_scheduler
     command: scheduler
     healthcheck:
-      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$(hostname)\""]
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     depends_on:
+      postgres-meta:
+        condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-      minio:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   pg_meta_data:
   airflow_logs:
-  minio_data:    # Persistent MinIO data — Parquet files survive container restarts
+  minio_data:    # Persistent Silo data — Parquet files survive container restarts

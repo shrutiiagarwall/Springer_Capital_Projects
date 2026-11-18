@@ -1,7 +1,7 @@
 """
 run_negative_tests.py
 =====================
-DHAP-42 — Negative Test Runner (direct validation, no REST API required)
+Stage 2 — Negative Test Runner (direct validation, no REST API required)
 
 Calls the validate_contract logic directly from the DAG module for each
 bad-CSV fixture and asserts that it raises AirflowFailException.
@@ -27,7 +27,7 @@ from pathlib import Path
 # Load the DAG module so we can extract the validate_contract function
 # ---------------------------------------------------------------------------
 DAG_PATH = Path("/opt/airflow/dags/csv_to_parquet_minio.py")
-CONTRACT_PATH = Path("/opt/airflow/config/schema_contract.yaml")
+CONTRACT_PATH = Path("/opt/airflow/mailex_email_event_extraction/schema_contract.yaml")
 FIXTURES_DIR = Path("/opt/airflow/tests/fixtures")
 BAD_MISSING_COL = Path("/opt/airflow/tests/bad_missing_column.csv")
 
@@ -160,7 +160,7 @@ FIXTURES: list[tuple[str, Path]] = [
 # Run
 # ---------------------------------------------------------------------------
 print("=" * 72)
-print("DHAP-42 — Negative Test Runner (direct validation)")
+print("Stage 2 — Negative Test Runner (direct validation)")
 print("=" * 72)
 print(f"Contract : {CONTRACT_PATH}")
 print(f"Fixtures : {FIXTURES_DIR}\n")
