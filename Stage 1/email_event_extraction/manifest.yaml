@@ -1,0 +1,86 @@
+# manifest.yaml
+# Dataset manifest for DHAP-34 — Email Event Extraction
+# Owner: shruti
+
+dataset_name: email_event_extraction
+
+source:
+  name: "MailEx: Email Event and Argument Extraction"
+  corpus: Enron Email Corpus (subset)
+  paper:
+    title: "MailEx: Email Event and Argument Extraction"
+    authors:
+      - Srivastava, Saurabh
+      - Singh, Gaurav
+      - Matsumoto, Shou
+      - Raz, Ali
+      - Costa, Paulo
+      - Poore, Joshua
+      - Yao, Ziyu
+    venue: "EMNLP 2023 (Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing)"
+    doi: "10.18653/v1/2023.emnlp-main.801"
+    url: "https://aclanthology.org/2023.emnlp-main.801"
+  github: "https://github.com/salokr/Email-Event-Extraction"
+  license: "CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/legalcode)"
+
+owner: shruti
+
+# Dataset-list analysis status per dataset code:
+#   code 103 → status "."  (blank / not yet recorded), status2 "pending"
+#   code 130 → no status recorded
+status: "."
+status2: pending
+
+splits:
+  train: 1200   # email threads
+  dev:   150
+  test:  150
+  total: 1500
+
+raw_format: JSON
+# Each JSON file encodes one email thread.  The top-level keys are:
+#   "events"    — nested dict: turn_id → event_type → {labels, triggers, extras}
+#   "sentences" — list of tokenised sentences, parallel to turn indices
+
+pipeline_input:
+  format: CSV
+  path: data/raw/email_event_extraction.csv
+  # Exact row count produced by flatten_to_csv.py on the full dataset:
+  #   train=7207, dev=1016, test=945  → total=9168
+  # This includes annotated event instances AND "O" (no-event) placeholder rows.
+  row_count: 9168
+
+flattening_step:
+  script: scripts/flatten_to_csv.py
+  description: >
+    Because the raw dataset is in hierarchical JSON (one file per email thread,
+    with nested structures for turns, event types, trigger lists, and BIO label
+    arrays), it cannot be ingested directly by a SQL loader.  The flattening
+    script walks the train/dev/test split directories, emits one CSV row per
+    (file, turn, event_type, trigger) combination, reconstructs sentence text
+    from the parallel token array, and counts non-O BIO tags as num_arguments.
+    The resulting CSV is treated as the canonical "downloaded from SharePoint"
+    input for the Airflow pipeline — the DAG never reads the raw JSON directly.
+  idempotent: true
+  run_before_docker_compose: true
+
+event_types:
+  - Request_Action
+  - Request_Data
+  - Request_Meeting
+  - Request_Action_Data
+  - Request_Meeting_Data
+  - Deliver_Data
+  - Deliver_Action_Data
+  - Deliver_Meeting_Data
+  - Amend_Data
+  - Amend_Meeting_Data
+  - Amend_Action_Data
+  - O   # no event (background / non-event sentences)
+
+description: >
+  MailEx is the first dataset for email event extraction, built on a subset of
+  the Enron corpus.  It covers 1 500 email threads (~4K emails) annotated with
+  ~9K event instances across 10 event types and 76 argument roles.  The dataset
+  was released under CC BY-SA 4.0 and is used here for analytical ingestion into
+  a PostgreSQL data warehouse via Apache Airflow (Glynac AI, DHAP-34).

@@ -1,0 +1,85 @@
+# schema.yaml
+# Column-level schema for the email_event_extraction dataset.
+# Used by the Airflow DAG's validate_schema task to enforce correctness
+# before any data reaches PostgreSQL.
+#
+# type values mirror Python/pandas dtypes:
+#   integer  →  int64  (or nullable Int64 in pandas)
+#   string   →  object / str
+#
+# nullable: false  means the column must have no NULL / NaN values.
+# nullable: true   means the column may be NULL (empty string → NULL in transform step).
+
+columns:
+
+  - name: id
+    type: integer
+    nullable: false
+    primary_key: true
+    description: >
+      Surrogate auto-increment integer key.  Assigned sequentially by
+      flatten_to_csv.py across all splits in train → dev → test order.
+
+  - name: thread_file
+    type: string
+    nullable: false
+    description: >
+      Source JSON filename (e.g. "lay-k_inbox187.json").  Encodes the Enron
+      mailbox owner, subfolder, and index.
+
+  - name: split
+    type: string
+    nullable: false
+    allowed_values: [train, dev, test]
+    description: Dataset split this row belongs to.
+
+  - name: turn_id
+    type: string
+    nullable: false
+    description: >
+      Turn identifier within the email thread (e.g. "turn_0", "turn_1").
+      Corresponds to the position in the "sentences" array of the source JSON.
+
+  - name: event_type
+    type: string
+    nullable: false
+    description: >
+      One of the 10 MailEx event types (e.g. "Request_Meeting", "Deliver_Data").
+      "O" denotes a non-event annotation if present.
+
+  - name: trigger_text
+    type: string
+    nullable: true
+    description: >
+      The surface string of the event trigger (e.g. "we need", "please send").
+      NULL when a turn has an event annotation but no associated trigger span.
+
+  - name: trigger_indices
+    type: string
+    nullable: true
+    description: >
+      Space-separated token indices of the trigger within the sentence
+      (e.g. "0 1 2").  NULL when trigger_text is NULL.
+
+  - name: extras
+    type: string
+    nullable: true
+    description: >
+      Meta-semantic role string from the annotation (e.g. "Query Items  : Data Value").
+      NULL when the extras field was empty in the source JSON.
+
+  - name: sentence_text
+    type: string
+    nullable: true
+    description: >
+      Full sentence reconstructed by joining the token list from the parallel
+      "sentences" array (e.g. "we need a fourth again").  NULL when the turn
+      index is out of range in the source file.
+
+  - name: num_arguments
+    type: integer
+    nullable: false
+    description: >
+      Count of non-O BIO tags associated with this event in its turn.
+      Represents how many argument tokens were annotated.  Zero is valid
+      (trigger present, no argument spans).
